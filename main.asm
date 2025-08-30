@@ -12,15 +12,19 @@ extrn ShowWindow : proc
 extrn PostQuitMessage : proc
 extrn MessageBoxA : proc
 extrn RegOpenKeyExA : proc
-extrn RegCreateKeyExA : proc
 extrn RegSetValueExA : proc
 extrn RegQueryValueExA : proc
 extrn RegCloseKey : proc
-extrn SHEmptyRecycleBinW : proc
-extrn wsprintfA : proc
 extrn SHEmptyRecycleBinA : proc
+extrn lstrlenA : proc
+extrn SetWindowTextA:proc
+extrn GetVolumeNameForVolumeMountPointA:proc
+extrn GetStdHandle:proc
+extrn WriteConsoleA:proc
 
-; Директивы для линковки
+
+
+
 includelib kernel32.lib
 includelib user32.lib
 includelib advapi32.lib
@@ -31,7 +35,6 @@ WM_DESTROY      equ 2
 WM_COMMAND      equ 111h
 CS_HREDRAW      equ 2
 CS_VREDRAW      equ 1
-CW_USEDEFAULT   equ 80000000h
 WS_OVERLAPPEDWINDOW equ 0CF0000h
 WS_VISIBLE      equ 10000000h
 WS_CHILD        equ 40000000h
@@ -49,14 +52,12 @@ SHERB_NOCONFIRMATION  equ 1h
 SHERB_NOPROGRESSUI    equ 2h
 SHERB_NOSOUND         equ 4h
 
-
 .data
 ClassName       db "RecycleBinControl",0
-AppName         db "Recycle Bin Control",0
+AppName         db "Recycle Bin ",0
 ButtonToggleText db "Toggle Recycle Bin",0
 ButtonClearText db "Clear Recycle Bin",0
 BUTTON_CLASS    db "BUTTON",0
-TestMessage     db "Button clicked!",0
 
 .data?
 hInstance       dq ?
@@ -67,22 +68,32 @@ wc              db 80 dup(?)
 msg             db 48 dup(?)
 
 .data
-; Используйте GUID вашего системного диска
-RecycleKeyPath  db "Software\Microsoft\Windows\CurrentVersion\Explorer\BitBucket\Volume\{7afc80d5-777b-4cc8-82d7-7350aad360dd}",0
+RecycleKeyPath  db 200 dup(0)
 ValueName       db "NukeOnDelete",0
-MsgEnabled      db "Recycle Bin: ENABLED",0
-MsgDisabled     db "Recycle Bin: DISABLED",0
-MsgCleared      db "Recycle Bin cleared!",0
-MsgError        db "Error: Operation failed",0
+MsgEnabled      db "ON",0
+MsgDisabled     db "OFF",0
+EmptySuffix db " (Empty)",0
 DebugMessage db "GetRecycleBinState returned: %d",0
 DebugTitle   db "Debug Info",0
 MsgSuccess   db "Success! Value: %d",0
-MsgErrorOpen db "Error: Cannot open registry key",0
-MsgErrorRead db "Error: Cannot read registry value",0
 MsgErrorGeneral db "Error reading registry value",0
-MsgClearOk    db "Корзина очищена",0
-MsgClearError db "Ошибка очистки корзины",0
-DebugBuffer  db 256 dup(0)
+RecycleBinFileCount dq 1  
+
+
+RecycleBinPath db "C:\$Recycle.Bin\*",0
+
+
+.data
+BaseKeyPath db "Software\Microsoft\Windows\CurrentVersion\Explorer\BitBucket\Volume",0
+mountPoint db "C:\",0
+volumeGUID db 50 dup(0)
+bytesWritten dq 0
+
+; Сообщения для диагностики
+MsgEmptyPath     db "Error: Path is empty!",0
+MsgOpenError     db "Error: Cannot open registry key!",0
+MsgReadError     db "Error: Cannot read registry value!",0
+MsgToggleError  db "Error toggling Recycle Bin state",0
 
 .data?
 hKey            dq ?
@@ -113,13 +124,71 @@ RestoreRegs MACRO
     pop rbx
 ENDM
 
+
+GetRecycleKeyPath proc
+    SaveRegs
+    sub rsp, 20h
+    
+    ; Получаем GUID тома
+    mov rcx, offset mountPoint
+    mov rdx, offset volumeGUID
+    mov r8, sizeof volumeGUID
+    call GetVolumeNameForVolumeMountPointA
+    test rax, rax
+    jz fail
+
+    ; Копируем базовый путь в глобальную переменную
+    mov rdi, offset RecycleKeyPath
+    mov rsi, offset BaseKeyPath
+copy_base:
+    mov al, [rsi]
+    mov [rdi], al
+    inc rsi
+    inc rdi
+    test al, al
+    jnz copy_base
+    dec rdi ; Возвращаемся на терминальный ноль
+
+    ; Добавляем обратный слеш!
+    mov byte ptr [rdi], '\'
+    inc rdi
+
+    ; Копируем GUID
+    mov rsi, offset volumeGUID
+    add rsi, 10
+copy_guid:
+    mov al, [rsi]
+    mov [rdi], al
+    inc rdi
+    inc rsi
+    cmp al, '}'
+    jne copy_guid
+
+    ; Завершаем 0
+    mov byte ptr [rdi], 0
+    jmp success
+
+fail:
+    ; В случае ошибки просто обнуляем путь
+    mov byte ptr [RecycleKeyPath], 0
+
+success:
+    add rsp, 20h
+    RestoreRegs
+    ret
+GetRecycleKeyPath endp
+
+
+
+
 main proc
     sub rsp, 28h
-    
+
     ; Получаем handle модуля
     xor rcx, rcx
     call GetModuleHandleA
     mov hInstance, rax
+    
     
     ; Заполняем структуру WNDCLASSEXA
     mov dword ptr [wc], 80        ; cbSize
@@ -152,7 +221,7 @@ main proc
     
     mov qword ptr [rsp+20h], 100    ; X
     mov qword ptr [rsp+28h], 100    ; Y
-    mov qword ptr [rsp+30h], 300    ; nWidth
+    mov qword ptr [rsp+30h], 300   ; nWidth
     mov qword ptr [rsp+38h], 200    ; nHeight
     mov qword ptr [rsp+40h], 0      ; hWndParent
     mov qword ptr [rsp+48h], 0      ; hMenu
@@ -204,7 +273,11 @@ main proc
     
     call CreateWindowExA
     mov hButtonClear, rax
-    
+
+    call GetRecycleKeyPath
+
+    call UpdateWindowTitle
+
     ; Показываем окно
     mov rcx, hWndMain
     mov edx, SW_SHOW
@@ -319,12 +392,102 @@ WndProc endp
 
 
 
+UpdateWindowTitle proc
+    SaveRegs
+    sub rsp, 100h
+    
+    call GetRecycleBinState
+    mov ebx, eax
+    
+    ; Локальный буфер для заголовка
+    lea rdi, [rsp+20h]
+    
+    ; Копируем базовое название
+    mov rsi, offset AppName
+copy_base:
+    mov al, [rsi]
+    mov [rdi], al
+    inc rsi
+    inc rdi
+    test al, al
+    jnz copy_base
+    dec rdi
+    
+    mov word ptr [rdi], ' -'
+    add rdi, 2
+    
+    cmp ebx, 0
+    je add_enabled
+    cmp ebx, 1
+    je add_disabled
+    jmp add_unknown
+    
+add_enabled:
+    mov rsi, offset MsgEnabled
+    jmp copy_status
+    
+add_disabled:
+    mov rsi, offset MsgDisabled
+    jmp copy_status
+    
+add_unknown:
+    mov rsi, offset MsgErrorGeneral
+    
+copy_status:
+    mov al, [rsi]
+    mov [rdi], al
+    inc rsi
+    inc rdi
+    test al, al
+    jnz copy_status
+    
+    ; Проверяем количество файлов в корзине через переменную RecycleBinFileCount
+    cmp RecycleBinFileCount, 0
+    jg set_title          ; Если файлы есть - не добавляем Empty
+    
+    ; Добавляем " (Empty)"
+    mov rsi, offset EmptySuffix
+add_empty:
+    mov al, [rsi]
+    mov [rdi], al
+    inc rsi
+    inc rdi
+    test al, al
+    jnz add_empty
+    
+set_title:
+    mov rcx, hWndMain
+    lea rdx, [rsp+20h]
+    call SetWindowTextA
+    
+    add rsp, 100h
+    RestoreRegs
+    ret
+UpdateWindowTitle endp
+
 ; Функция чтения текущего состояния корзины
 ; Возвращает: RAX = 0 (включена) или 1 (выключена)
 GetRecycleBinState proc
     SaveRegs    
     sub rsp, 40h
     
+    
+    ; Проверяем что путь не пустой
+    lea rcx, RecycleKeyPath
+    call lstrlenA
+    test eax, eax
+    jnz path_not_empty
+    
+    ; Путь пустой - показываем ошибку
+    mov rcx, 0
+    lea rdx, MsgEmptyPath
+    mov r8, offset DebugTitle
+    mov r9, 0
+    call MessageBoxA
+    mov eax, 0FFFFFFFFh
+    jmp ExitGetState
+    
+path_not_empty:
     ; Инициализируем переменные
     mov hKey, 0
     mov dwValue, 0
@@ -339,17 +502,27 @@ GetRecycleBinState proc
     mov [rsp+20h], rax
     call RegOpenKeyExA
     
+    ; Показываем результат открытия ключа
     test rax, rax
-    jnz ErrorGetState
+    jz open_success
     
-    ; Читаем значение - ПРАВИЛЬНЫЙ вызов!
-    mov rcx, hKey                 ; hKey
-    lea rdx, ValueName            ; lpValueName
-    xor r8, r8                    ; lpReserved
-    lea r9, dwType                ; lpType
-    lea rax, dwValue              ; lpData
+    ; Ошибка открытия
+    mov rcx, 0
+    lea rdx, MsgOpenError
+    mov r8, offset DebugTitle
+    mov r9, 0
+    call MessageBoxA
+    jmp ErrorGetState
+    
+open_success:
+    ; Читаем значение
+    mov rcx, hKey
+    lea rdx, ValueName
+    xor r8, r8
+    lea r9, dwType
+    lea rax, dwValue
     mov [rsp+20h], rax
-    lea rax, dwSize               ; lpcbData
+    lea rax, dwSize
     mov [rsp+28h], rax
     call RegQueryValueExA
     
@@ -359,7 +532,7 @@ GetRecycleBinState proc
     ; Закрываем ключ
     mov rcx, hKey
     call RegCloseKey
-    
+
     ; Возвращаем значение
     mov eax, dwValue
     jmp ExitGetState
@@ -367,11 +540,26 @@ GetRecycleBinState proc
 ErrorReadValue:
     mov rcx, hKey
     call RegCloseKey
-    mov eax, 0FFFFFFFEh  ; Код ошибки чтения
+    
+    ; Показываем ошибку чтения
+    mov rcx, 0
+    lea rdx, MsgReadError
+    mov r8, offset DebugTitle
+    mov r9, 0
+    call MessageBoxA
+    
+    mov eax, 0FFFFFFFEh
     jmp ExitGetState
     
 ErrorGetState:
-    mov eax, 0FFFFFFFFh  ; Код ошибки открытия
+    ; Показываем ошибку открытия
+    mov rcx, 0
+    lea rdx, MsgOpenError
+    mov r8, offset DebugTitle
+    mov r9, 0
+    call MessageBoxA
+    
+    mov eax, 0FFFFFFFFh
     
 ExitGetState:
     add rsp, 40h
@@ -389,7 +577,7 @@ SetRecycleBinState proc
     
     ; Открываем ключ
     mov rcx, HKEY_CURRENT_USER
-    lea rdx, RecycleKeyPath
+    lea rdx, RecycleKeyPath    ; Теперь здесь актуальный путь
     xor r8, r8
     mov r9, KEY_SET_VALUE
     lea rax, hKey
@@ -437,41 +625,24 @@ ClearRecycleBin proc
     SaveRegs
     sub rsp, 28h
     
-    ; Вызываем SHEmptyRecycleBinA (или W, в зависимости от того, что вам нужно)
-    xor rcx, rcx                    ; hwnd = NULL
-    xor rdx, rdx                    ; pszRootPath = NULL
-    mov r8d, SHERB_NOCONFIRMATION or SHERB_NOPROGRESSUI or SHERB_NOSOUND ; flags
+    ; Вызываем SHEmptyRecycleBinA
+    xor rcx, rcx
+    xor rdx, rdx
+    mov r8d, SHERB_NOCONFIRMATION or SHERB_NOPROGRESSUI or SHERB_NOSOUND
     call SHEmptyRecycleBinA
-    mov ebx, eax                    ; сохраняем результат
     
-    test ebx, ebx
-    jnz ErrorClear
+    ; Всегда устанавливаем счетчик в 0 (предполагаем успешную очистку)
+    mov RecycleBinFileCount, 0
     
-    ; Показываем сообщение об успехе
-    xor rcx, rcx
-    lea rdx, MsgClearOk
-    lea r8, DebugTitle
-    xor r9, r9
-    call MessageBoxA
-    xor eax, eax
-    jmp ExitClear
+    ; ОБНОВЛЯЕМ ЗАГОЛОВОК ПОСЛЕ ОЧИСТКИ
+    call UpdateWindowTitle
     
-ErrorClear:
-    ; Показываем сообщение об ошибке
-    xor rcx, rcx
-    lea rdx, MsgClearError
-    lea r8, DebugTitle
-    xor r9, r9
-    call MessageBoxA
-    mov eax, 1
+    xor eax, eax  ; Всегда возвращаем успех
     
-ExitClear:
     add rsp, 28h
     RestoreRegs
     ret
 ClearRecycleBin endp
-
-
 
 ToggleRecycleBin proc
     SaveRegs
@@ -494,34 +665,13 @@ ToggleRecycleBin proc
     call SetRecycleBinState
     test eax, eax
     jnz ExitToggleError
+
+    call UpdateWindowTitle
+
     
-    ; Показываем новый статус
     call GetRecycleBinState  ; Снова читаем для подтверждения
-    cmp eax, 0
-    je ShowNowEnabled
-    cmp eax, 1
-    je ShowNowDisabled
     jmp ExitToggle
     
-ShowNowEnabled:
-    sub rsp, 20h
-    mov rcx, 0
-    lea rdx, MsgNowEnabled
-    lea r8, DebugTitle
-    xor r9, r9
-    call MessageBoxA
-    add rsp, 20h
-    jmp ExitToggle
-    
-ShowNowDisabled:
-    sub rsp, 20h
-    mov rcx, 0
-    lea rdx, MsgNowDisabled
-    lea r8, DebugTitle
-    xor r9, r9
-    call MessageBoxA
-    add rsp, 20h
-    jmp ExitToggle
     
 ExitToggleError:
     sub rsp, 20h
@@ -538,45 +688,5 @@ ExitToggle:
     ret
 ToggleRecycleBin endp
 
-.data
-MsgNowEnabled   db "Recycle Bin has been ENABLED",0
-MsgNowDisabled  db "Recycle Bin has been DISABLED",0
-MsgToggleError  db "Error toggling Recycle Bin state",0
-
-
-; Функция обновления статуса в GUI
-UpdateStatus proc
-    ; Сохраняем все регистры, которые могут быть испорчены
-SaveRegs
-    sub rsp, 28h
-    
-    ; Получаем текущее состояние и сохраняем его
-    call GetRecycleBinState
-    mov ebx, eax    ; Сохраняем результат в EBX (нетемповый регистр)
-    
-    test ebx, ebx   ; Проверяем сохраненное значение
-    jz ShowEnabled
-    
-    ; Показываем "DISABLED"
-    xor rcx, rcx
-    lea rdx, MsgDisabled
-    lea r8, AppName
-    xor r9, r9
-    call MessageBoxA
-    jmp ExitUpdate
-    
-ShowEnabled:
-    ; Показываем "ENABLED"
-    xor rcx, rcx
-    lea rdx, MsgEnabled
-    lea r8, AppName
-    xor r9, r9
-    call MessageBoxA
-    
-ExitUpdate:
-    add rsp, 28h
-    RestoreRegs
-    ret
-UpdateStatus endp
 
 end
